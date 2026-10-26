@@ -1,2 +1,2 @@
-/** Public repository; change this in a fork. */
-export const REPO_URL = "https://github.com/designfuchen/word-atlas";
+/** This fork's repository; content still credits upstream authors (see CONTENT_LICENSE.md). */
+export const REPO_URL = "https://github.com/xueweijian/word-atlas";

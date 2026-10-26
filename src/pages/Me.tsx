@@ -1,6 +1,8 @@
 import { Download, RotateCcw, Upload } from "lucide-react";
-import { useMemo, useRef } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useAtlas } from "../atlas/context";
+import { isNativePlatform } from "../lib/native";
+import { downloadBackup } from "../lib/backup";
 import { isMastered } from "../store/srs";
 import { dayKey, exportBackup, importBackup, resetProgress, store, useStore, type Settings } from "../store/store";
 import { toast } from "../ui/Toast";
@@ -33,13 +35,17 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
   }, [progress]);
 
   const set = (patch: Partial<Settings>) => store.settings(patch);
-  const download = () => {
-    const blob = new Blob([exportBackup()], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `word-atlas-backup-${dayKey()}.json`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  const [sharing, setSharing] = useState(false);
+  const download = async () => {
+    if (sharing) return;
+    setSharing(true);
+    try {
+      await downloadBackup(`word-atlas-backup-${dayKey()}.json`, exportBackup());
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "导出失败，请重试。", "warn");
+    } finally {
+      setSharing(false);
+    }
   };
   const restore = async (f: File) => {
     if (f.size > 30 * 1024 * 1024) return toast("文件太大，不像是学习备份。", "warn");
@@ -182,6 +188,7 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
         <section className="panel">
           <h3 className="eyebrow">数据</h3>
           <p className="muted">进度只存在这台设备的浏览器里：没有账号，没有服务器。换设备时，导出备份再导入即可。</p>
+          {isNativePlatform() && <p className="muted">Android 版点「导出备份」会打开系统分享，可存到文件管理或发到微信/网盘。</p>}
           {saveError && <p className="warn-text">浏览器拒绝保存（可能是隐私模式或空间已满）。请尽快导出备份。</p>}
           <div className="data-actions">
             <button className="btn btn-ghost" onClick={download}>
@@ -189,6 +196,8 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
             </button>
             <button className="btn btn-ghost" onClick={() => file.current?.click()}>
               <Upload size={18} /> 导入备份
+            </button>
+            <input ref={file��
             </button>
             <input ref={file} type="file" accept="application/json,.json" hidden onChange={(e) => e.target.files?.[0] && restore(e.target.files[0]).finally(() => (e.target.value = ""))} />
             <button

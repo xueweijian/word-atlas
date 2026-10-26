@@ -85,8 +85,9 @@ function localMedia(
   }
 }
 export default defineConfig({
-  // Deploy under a sub-path with ATLAS_BASE=/words/ npm run build
-  base: process.env.ATLAS_BASE || "/",
+  // Web: deploy under a sub-path with ATLAS_BASE=/words/ npm run build
+  // Native APK: CAPACITOR_BUILD=1 npm run build -> relative asset paths
+  base: process.env.CAPACITOR_BUILD ? "./" : process.env.ATLAS_BASE || "/",
   plugins: [
     react(),
     {

@@ -108,6 +108,9 @@ export function About() {
       <p className="colophon">
         <Heart size={14} /> 做给每一个在背单词的人。
       </p>
+      <p className="colophon muted">
+        本应用由开源项目 Word Atlas 构建（代码 MIT，词库/插画/录音 CC BY 4.0，署名 Word Atlas contributors），与其上游无关。
+      </p>
     </div>
   );
 }
