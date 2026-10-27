@@ -38,11 +38,12 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      - name: Setup Java (Gradle needs JDK 17+)
+      - name: Setup Java (Gradle needs JDK 21+, cache gradle deps)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
 
       - name: Install deps
         run: npm ci
@@ -191,19 +192,16 @@ jobs:
             NOTE="debug 签名包（可直接安装，先顶着）。要出正式签名：在仓库 Secrets 里加 ANDROID_KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD 后重打 tag。"
           fi
           if [ ! -f "$APK" ]; then echo "APK missing: $APK"; ls -R android/app/build/outputs/apk || true; exit 1; fi
-            cp "$APK" "$OUT"
-            ls -lh "$OUT"
-            gh release create "$TAG" "$OUT" \
-              --title "词光 $TAG" \
-              --notes "词光 Word Atlas Android 版（fork 自 designfuchen/word-atlas，代码 MIT，词库/插画/录音 CC BY 4.0 署名 Word Atlas contributors）。
+          cp "$APK" "$OUT"
+          ls -lh "$OUT"
+          gh release create "$TAG" "$OUT" \
+            --title "词光 $TAG" \
+            --notes "词光 Word Atlas Android 版（fork 自 designfuchen/word-atlas，代码 MIT，词库/插画/录音 CC BY 4.0 署名 Word Atlas contributors）。
 
           $NOTE
 
           安装：下载 apk 后直接安装（需允许「安装未知应用」）。
           体积：约 650MB，全量 7298 词插画 + 英美发音 + 例句朗读，打包进本地，断网可刷。"
-          else
-            echo "release APK missing"; ls -R android/app/build/outputs/apk || true; exit 1
-          fi
 
   # ==========================================================================
   # emulator-smoke —— API 34 模拟器冒烟：第一性原理验证「APK 能装能启动」
@@ -215,6 +213,10 @@ jobs:
     needs: build                    # 消费 build job 的 wordatlas-debug artifact
     runs-on: ubuntu-latest          # 托管 runner 自带 /dev/kvm
     timeout-minutes: 30
+    strategy:
+      fail-fast: false              # 一台挂别连坐，三台并行各出各的证据
+      matrix:
+        api-level: [28, 34, 35]     # 三代 Android 并发：旧机兼容 / 主流 / 最新
     steps:
       - name: KVM 健康检查（无硬件加速立即失败，不烧超时）
         run: |
@@ -241,79 +243,90 @@ jobs:
       - name: 确认 APK 落盘（区分产物问题 vs 模拟器问题）
         run: ls -lh apk/app-debug.apk
 
-      - name: 启动模拟器并跑冒烟断言
+      # ⚠️ android-emulator-runner 的 script: 是逐行 sh -c 执行的（变量/控制流不跨行），
+      # 所以冒烟逻辑必须先落成文件，再用单行 bash smoke.sh 调用。
+      - name: 生成冒烟脚本（单文件，绕开 action 逐行执行限制）
+        run: |
+          cat > smoke.sh <<'SMOKE_EOF'
+          #!/usr/bin/env bash
+          # 冒烟四锚点：装得上 / 起得来 / 进程不死 / 画面已合成。
+          # 失败路径自管：先把证据落盘再退出（模拟器在 script 结束即被杀）。
+          set +e
+          PKG="com.xueweijian.wordatlas"
+          ACT="com.xueweijian.wordatlas/.MainActivity"
+          APK="apk/app-debug.apk"
+          OUT="emulator-smoke"
+          mkdir -p "$OUT"
+          FAIL=""
+
+          echo "== 锚点1「装得上」：adb install + 包列表核验 =="
+          adb install -r -t -g "$APK"
+          if ! adb shell pm list packages | grep -q "package:$PKG"; then
+            echo "::error::安装后包列表里没有 $PKG（见上方 adb install 报错，如 NO_MATCHING_ABIS / 签名）"
+            FAIL="install"
+          fi
+
+          echo "== 锚点2「起得来」：am start -W 等 Launcher 返回 =="
+          start_out=$(adb shell am start -W -n "$ACT")
+          echo "$start_out"
+          echo "$start_out" | grep -q "Status: ok" || {
+            echo "::error::am start 未返回 ok（Activity 不存在 / 被拒启）"
+            FAIL="$FAIL am_start"
+          }
+
+          echo "== 锚点3「进程不死」：pidof 连续 30 秒非空（抓启动即崩）=="
+          alive=0
+          for i in $(seq 1 30); do
+            pid=$(adb shell pidof "$PKG" | tr -d '\r')
+            if [ -n "$pid" ]; then
+              alive=$((alive+1)); sleep 1
+            else
+              echo "::error::进程在第 ${alive}s 后消失（启动即崩），见 logcat"
+              FAIL="$FAIL process_died"
+              break
+            fi
+          done
+          echo "进程存活 ${alive}s / 要求 >= 30s"
+
+          echo "== 锚点3.5「前台确实是词光」（缓解白屏假绿，warning 级）=="
+          adb shell dumpsys window | grep -m1 mCurrentFocus || true
+          adb shell dumpsys window | grep -m1 mCurrentFocus | grep -q "$PKG" \
+            || echo "::warning::前台窗口不含 $PKG —— 可能白屏/被系统页覆盖，看截图 artifact"
+
+          echo "== 采集证据（必须在模拟器活着时做：action 退出即杀模拟器）=="
+          adb exec-out screencap -p > "$OUT/screen.png"   # exec-out 不做 \n→\r\n 转换，PNG 不坏
+          adb logcat -d | tail -200 > "$OUT/logcat.txt"
+          ls -l "$OUT"
+          if [ ! -s "$OUT/screen.png" ]; then
+            echo "::error::截图 0 字节：SurfaceFlinger 没有合成出任何画面"
+            FAIL="$FAIL no_screen"
+          elif [ "$(wc -c < "$OUT/screen.png")" -lt 10240 ]; then
+            echo "::warning::截图 <10KB，疑似黑屏/纯色（弱断言，人工看 artifact）"
+          fi
+
+          if [ -n "$FAIL" ] || [ "$alive" -lt 30 ]; then
+            echo "::error::冒烟失败，原因:[$FAIL] 存活:${alive}s"
+            exit 1
+          fi
+          echo "== 冒烟通过：装得上 + 起得来 + 30s 进程不死 + 有合成画面 =="
+          SMOKE_EOF
+          bash -n smoke.sh && echo "smoke.sh syntax OK"
+
+      - name: 启动模拟器并跑冒烟断言 (API ${{ matrix.api-level }})
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 34
+          api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64              # 必须匹配 x86 runner，arm64 镜像跑不起来
           profile: pixel_5
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: |
-            set +e   # 冒烟脚本自管失败路径：任何锚点失败都先把证据落盘再退出
-            PKG="com.xueweijian.wordatlas"
-            ACT="com.xueweijian.wordatlas/.MainActivity"
-            APK="apk/app-debug.apk"
-            OUT="emulator-smoke"
-            mkdir -p "$OUT"
-            FAIL=""
-
-            echo "== 锚点1「装得上」：adb install + 包列表核验 =="
-            adb install -r -t -g "$APK"
-            if ! adb shell pm list packages | grep -q "package:$PKG"; then
-              echo "::error::安装后包列表里没有 $PKG（见上方 adb install 报错，如 NO_MATCHING_ABIS / 签名）"
-              FAIL="install"
-            fi
-
-            echo "== 锚点2「起得来」：am start -W 等 Launcher 返回 =="
-            start_out=$(adb shell am start -W -n "$ACT")
-            echo "$start_out"
-            echo "$start_out" | grep -q "Status: ok" || {
-              echo "::error::am start 未返回 ok（Activity 不存在 / 被拒启）"
-              FAIL="$FAIL am_start"
-            }
-
-            echo "== 锚点3「进程不死」：pidof 连续 30 秒非空（抓启动即崩）=="
-            alive=0
-            for i in $(seq 1 30); do
-              pid=$(adb shell pidof "$PKG" | tr -d '\r')
-              if [ -n "$pid" ]; then
-                alive=$((alive+1)); sleep 1
-              else
-                echo "::error::进程在第 ${alive}s 后消失（启动即崩），见 logcat"
-                FAIL="$FAIL process_died"
-                break
-              fi
-            done
-            echo "进程存活 ${alive}s / 要求 >= 30s"
-
-            echo "== 锚点3.5「前台确实是词光」（缓解白屏假绿，warning 级）=="
-            adb shell dumpsys window | grep -m1 mCurrentFocus || true
-            adb shell dumpsys window | grep -m1 mCurrentFocus | grep -q "$PKG" \
-              || echo "::warning::前台窗口不含 $PKG —— 可能白屏/被系统页覆盖，看截图 artifact"
-
-            echo "== 采集证据（必须在模拟器活着时做：action 退出即杀模拟器）=="
-            adb exec-out screencap -p > "$OUT/screen.png"   # exec-out 不做 \n→\r\n 转换，PNG 不坏
-            adb logcat -d | tail -200 > "$OUT/logcat.txt"
-            ls -l "$OUT"
-            if [ ! -s "$OUT/screen.png" ]; then
-              echo "::error::截图 0 字节：SurfaceFlinger 没有合成出任何画面"
-              FAIL="$FAIL no_screen"
-            elif [ "$(wc -c < "$OUT/screen.png")" -lt 10240 ]; then
-              echo "::warning::截图 <10KB，疑似黑屏/纯色（弱断言，人工看 artifact）"
-            fi
-
-            if [ -n "$FAIL" ] || [ "$alive" -lt 30 ]; then
-              echo "::error::冒烟失败，原因:[$FAIL] 存活:${alive}s"
-              exit 1
-            fi
-            echo "== 冒烟通过：装得上 + 起得来 + 30s 进程不死 + 有合成画面 =="
+          script: bash smoke.sh
 
       - name: 上传冒烟证据（截图 + logcat，无论成败）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-smoke
+          name: emulator-smoke-api${{ matrix.api-level }}
           path: emulator-smoke/
           if-no-files-found: warn
