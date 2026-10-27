@@ -204,3 +204,116 @@ jobs:
           else
             echo "release APK missing"; ls -R android/app/build/outputs/apk || true; exit 1
           fi
+
+  # ==========================================================================
+  # emulator-smoke —— API 34 模拟器冒烟：第一性原理验证「APK 能装能启动」
+  # 四个机器可验证的事实：装得上(pm list) / 起得来(am start -W ok) /
+  # 进程不死(pidof 连续30s) / 画面已合成(screencap 非空 PNG)。
+  # 截图是弱断言（白屏也非空），artifact 里人工看一眼；白屏假绿风险已知。
+  # ==========================================================================
+  emulator-smoke:
+    needs: build                    # 消费 build job 的 wordatlas-debug artifact
+    runs-on: ubuntu-latest          # 托管 runner 自带 /dev/kvm
+    timeout-minutes: 30
+    steps:
+      - name: KVM 健康检查（无硬件加速立即失败，不烧超时）
+        run: |
+          ls -l /dev/kvm || { echo "::error::/dev/kvm 不存在，无法硬件加速"; exit 1; }
+          if [ ! -w /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          [ -w /dev/kvm ] || { echo "::error::/dev/kvm 仍不可写"; exit 1; }
+
+      - name: Setup Java (sdkmanager/avdmanager 需要)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: 下载 APK artifact（wordatlas-debug）
+        uses: actions/download-artifact@v4
+        with:
+          name: wordatlas-debug
+          path: apk
+
+      - name: 确认 APK 落盘（区分产物问题 vs 模拟器问题）
+        run: ls -lh apk/app-debug.apk
+
+      - name: 启动模拟器并跑冒烟断言
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64              # 必须匹配 x86 runner，arm64 镜像跑不起来
+          profile: pixel_5
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set +e   # 冒烟脚本自管失败路径：任何锚点失败都先把证据落盘再退出
+            PKG="com.xueweijian.wordatlas"
+            ACT="com.xueweijian.wordatlas/.MainActivity"
+            APK="apk/app-debug.apk"
+            OUT="emulator-smoke"
+            mkdir -p "$OUT"
+            FAIL=""
+
+            echo "== 锚点1「装得上」：adb install + 包列表核验 =="
+            adb install -r -t -g "$APK"
+            if ! adb shell pm list packages | grep -q "package:$PKG"; then
+              echo "::error::安装后包列表里没有 $PKG（见上方 adb install 报错，如 NO_MATCHING_ABIS / 签名）"
+              FAIL="install"
+            fi
+
+            echo "== 锚点2「起得来」：am start -W 等 Launcher 返回 =="
+            start_out=$(adb shell am start -W -n "$ACT")
+            echo "$start_out"
+            echo "$start_out" | grep -q "Status: ok" || {
+              echo "::error::am start 未返回 ok（Activity 不存在 / 被拒启）"
+              FAIL="$FAIL am_start"
+            }
+
+            echo "== 锚点3「进程不死」：pidof 连续 30 秒非空（抓启动即崩）=="
+            alive=0
+            for i in $(seq 1 30); do
+              pid=$(adb shell pidof "$PKG" | tr -d '\r')
+              if [ -n "$pid" ]; then
+                alive=$((alive+1)); sleep 1
+              else
+                echo "::error::进程在第 ${alive}s 后消失（启动即崩），见 logcat"
+                FAIL="$FAIL process_died"
+                break
+              fi
+            done
+            echo "进程存活 ${alive}s / 要求 >= 30s"
+
+            echo "== 锚点3.5「前台确实是词光」（缓解白屏假绿，warning 级）=="
+            adb shell dumpsys window | grep -m1 mCurrentFocus || true
+            adb shell dumpsys window | grep -m1 mCurrentFocus | grep -q "$PKG" \
+              || echo "::warning::前台窗口不含 $PKG —— 可能白屏/被系统页覆盖，看截图 artifact"
+
+            echo "== 采集证据（必须在模拟器活着时做：action 退出即杀模拟器）=="
+            adb exec-out screencap -p > "$OUT/screen.png"   # exec-out 不做 \n→\r\n 转换，PNG 不坏
+            adb logcat -d | tail -200 > "$OUT/logcat.txt"
+            ls -l "$OUT"
+            if [ ! -s "$OUT/screen.png" ]; then
+              echo "::error::截图 0 字节：SurfaceFlinger 没有合成出任何画面"
+              FAIL="$FAIL no_screen"
+            elif [ "$(wc -c < "$OUT/screen.png")" -lt 10240 ]; then
+              echo "::warning::截图 <10KB，疑似黑屏/纯色（弱断言，人工看 artifact）"
+            fi
+
+            if [ -n "$FAIL" ] || [ "$alive" -lt 30 ]; then
+              echo "::error::冒烟失败，原因:[$FAIL] 存活:${alive}s"
+              exit 1
+            fi
+            echo "== 冒烟通过：装得上 + 起得来 + 30s 进程不死 + 有合成画面 =="
+
+      - name: 上传冒烟证据（截图 + logcat，无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-smoke
+          path: emulator-smoke/
+          if-no-files-found: warn
