@@ -191,13 +191,11 @@ export function Me({ privateAvailable }: { privateAvailable: boolean }) {
           {isNativePlatform() && <p className="muted">Android 版点「导出备份」会打开系统分享，可存到文件管理或发到微信/网盘。</p>}
           {saveError && <p className="warn-text">浏览器拒绝保存（可能是隐私模式或空间已满）。请尽快导出备份。</p>}
           <div className="data-actions">
-            <button className="btn btn-ghost" onClick={download}>
+            <button className="btn btn-ghost" onClick={download} disabled={sharing}>
               <Download size={18} /> 导出备份
             </button>
             <button className="btn btn-ghost" onClick={() => file.current?.click()}>
               <Upload size={18} /> 导入备份
-            </button>
-            <input ref={file��
             </button>
             <input ref={file} type="file" accept="application/json,.json" hidden onChange={(e) => e.target.files?.[0] && restore(e.target.files[0]).finally(() => (e.target.value = ""))} />
             <button
