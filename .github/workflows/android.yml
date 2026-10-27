@@ -20,7 +20,7 @@ permissions:
 
 env:
   NODE_VERSION: "22"
-  JAVA_VERSION: "17"
+  JAVA_VERSION: "21"
 
 jobs:
   build:
@@ -46,6 +46,9 @@ jobs:
 
       - name: Install deps
         run: npm ci
+
+      - name: Unit tests (node --test + tsx, upstream runner)
+        run: npm test
 
       - name: Build web assets for Capacitor (relative paths)
         run: npm run build:apk
@@ -81,6 +84,34 @@ jobs:
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
+
+      - name: Verify build contracts (offline payload parity + relative base)
+        run: |
+          set -e
+          # 1) dist must use relative asset paths (APK WebView has no server root)
+          test -f dist/index.html
+          grep -q 'src="./assets/' dist/index.html || { echo "FAIL: dist assets not relative"; grep -o 'src="[^"]*"' dist/index.html | head -3; exit 1; }
+          if grep -q 'src="/assets/' dist/index.html; then echo "FAIL: absolute /assets path leaked"; exit 1; fi
+          # 2) full offline payload present in dist (counts are external anchors:
+          #    derived from upstream git tree, not from the build itself)
+          for spec in "atlas/img webp 7298" "atlas/thumb webp 7298" "atlas/audio mp3 22905" "atlas/entries json 73"; do
+            set -- $spec
+            N=$(find "dist/$1" -type f -name "*.$2" | wc -l)
+            echo "dist/$1: $N *.$2"
+            [ "$N" -eq "$3" ] || { echo "FAIL: dist/$1 expected $3 got $N"; exit 1; }
+          done
+          test -f dist/atlas/index.json
+          # 3) cap sync must copy the payload into android assets 1:1
+          A=$(find android/app/src/main/assets/public/atlas -type f | wc -l)
+          D=$(find dist/atlas -type f | wc -l)
+          echo "android assets: $A / dist: $D"
+          [ "$A" -eq "$D" ] || { echo "FAIL: cap sync lost files"; exit 1; }
+          # 4) APK must physically contain the payload
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          IN_APK=$(unzip -l "$APK" | grep -c 'public/atlas/' || true)
+          echo "APK atlas entries: $IN_APK"
+          [ "${IN_APK:-0}" -ge 37575 ] || { echo "FAIL: APK payload incomplete"; exit 1; }
+          ls -lh "$APK"
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
